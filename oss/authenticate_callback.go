@@ -15,14 +15,11 @@ import (
 	"sync"
 )
 
-type authenticationType struct {
-	lock        *sync.RWMutex
-	certificate map[string]*rsa.PublicKey
-}
-
 var (
-	authentication = authenticationType{lock: &sync.RWMutex{}, certificate: map[string]*rsa.PublicKey{}}
-	urlReg         = regexp.MustCompile(`^http(|s)://gosspublic.alicdn.com/[0-9a-zA-Z]`)
+	publicKeys              sync.Map
+	urlReg                  = regexp.MustCompile(`^http(|s)://gosspublic.alicdn.com/[0-9a-zA-Z]`)
+	CertificateAddressError = errors.New("certificate address error")
+	CertificateDataError    = errors.New("certificate data error")
 )
 
 //验证OSS向业务服务器发来的回调函数。
@@ -40,21 +37,18 @@ func AuthenticateCallBack(pubKeyUrl, reqUrl, reqBody, authorization string) erro
 	url := string(keyURL)
 	//判断证书是否来自于阿里云
 	if !urlReg.Match(keyURL) {
-		return errors.New("certificate address error")
+		return CertificateAddressError
 	}
 	//获取文件名
-	rs := []rune(url)
-	filename := string(rs[strings.LastIndex(url, "/") : len(rs)-1])
-	authentication.lock.RLock()
-	certificate := authentication.certificate[filename]
-	authentication.lock.RUnlock()
-	//内存中没有证书，下载
-	if certificate == nil {
-		authentication.lock.Lock()
+	urlRunes := []rune(url)
+	filename := string(urlRunes[strings.LastIndex(url, "/") : len(urlRunes)-1])
+	certificate, ok := publicKeys.Load(filename)
+	if !ok {
 		res, err := http.Get(url)
 		if err != nil {
 			return err
 		}
+
 		defer res.Body.Close()
 		body, err := ioutil.ReadAll(res.Body)
 		if err != nil {
@@ -62,15 +56,14 @@ func AuthenticateCallBack(pubKeyUrl, reqUrl, reqBody, authorization string) erro
 		}
 		block, _ := pem.Decode(body)
 		if block == nil {
-			return errors.New("certificate error")
+			return CertificateDataError
 		}
 		pubKey, err := x509.ParsePKIXPublicKey(block.Bytes)
 		if err != nil {
 			return err
 		}
-		certificate = pubKey.(*rsa.PublicKey)
-		authentication.certificate[filename] = certificate
-		authentication.lock.Unlock()
+		certificate = pubKey
+		publicKeys.Store(filename, certificate)
 	}
 	//证书准备完毕，开始验证
 	//解析签名
@@ -78,11 +71,7 @@ func AuthenticateCallBack(pubKeyUrl, reqUrl, reqBody, authorization string) erro
 	if err != nil {
 		return err
 	}
-	hashed := md5.New()
-	hashed.Write([]byte(reqUrl + "\n" + reqBody))
-	if err := rsa.VerifyPKCS1v15(certificate, crypto.MD5, hashed.Sum(nil), signature); err != nil {
-		return err
-	}
-	//验证通过
-	return nil
+
+	hashed := md5.Sum([]byte(reqUrl + "\n" + reqBody))
+	return rsa.VerifyPKCS1v15(certificate.(*rsa.PublicKey), crypto.MD5, hashed[:], signature)
 }
